@@ -134,21 +134,47 @@ const TRANSCRIBE_PROMPT =
   'Transcribe this audio verbatim. Return only the transcribed text — no introductions, no labels, no quotation marks, no commentary. If the audio has no speech, return an empty string.'
 
 async function transcribeAudio(file_id: string, mime?: string): Promise<string | undefined> {
-  if (!geminiClient) return undefined
+  if (!geminiClient) {
+    process.stderr.write(`telegram channel: transcribe skipped — geminiClient null\n`)
+    return undefined
+  }
   try {
     const file = await bot.api.getFile(file_id)
-    if (!file.file_path) return undefined
+    process.stderr.write(
+      `telegram channel: transcribe getFile ok file_id=${file_id} path=${file.file_path} size=${file.file_size} mime=${mime}\n`,
+    )
+    if (!file.file_path) {
+      process.stderr.write(`telegram channel: transcribe skipped — no file_path\n`)
+      return undefined
+    }
     // Defensive: skip when Telegram omits file_size rather than treating
     // missing as zero (the Bot API caps at 20MB but don't rely on it).
-    if (file.file_size == null || file.file_size > MAX_TRANSCRIBE_BYTES) return undefined
+    if (file.file_size == null || file.file_size > MAX_TRANSCRIBE_BYTES) {
+      process.stderr.write(
+        `telegram channel: transcribe skipped — file_size ${file.file_size} (max ${MAX_TRANSCRIBE_BYTES})\n`,
+      )
+      return undefined
+    }
     const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
     const res = await proxiedFetch(url)
-    if (!res.ok) return undefined
+    if (!res.ok) {
+      process.stderr.write(`telegram channel: transcribe skipped — HTTP ${res.status} from file download\n`)
+      return undefined
+    }
     const contentLength = Number(res.headers.get('content-length') ?? 0)
-    if (contentLength > MAX_TRANSCRIBE_BYTES) return undefined
+    if (contentLength > MAX_TRANSCRIBE_BYTES) {
+      process.stderr.write(`telegram channel: transcribe skipped — content-length ${contentLength} > max\n`)
+      return undefined
+    }
     const buf = Buffer.from(await res.arrayBuffer())
-    if (buf.byteLength > MAX_TRANSCRIBE_BYTES) return undefined
+    if (buf.byteLength > MAX_TRANSCRIBE_BYTES) {
+      process.stderr.write(`telegram channel: transcribe skipped — buffer ${buf.byteLength} > max\n`)
+      return undefined
+    }
     const data = buf.toString('base64')
+    process.stderr.write(
+      `telegram channel: transcribe calling gemini model=${GEMINI_MODEL} bytes=${buf.byteLength} mime=${mime || 'audio/ogg'}\n`,
+    )
     const response = await withGeminiProxy(() =>
       geminiClient!.models.generateContent({
         model: GEMINI_MODEL,
@@ -158,7 +184,11 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
         ],
       }),
     )
-    const text = (response.text ?? '').trim()
+    const rawText = response.text ?? ''
+    const text = rawText.trim()
+    process.stderr.write(
+      `telegram channel: transcribe gemini response rawLen=${rawText.length} trimLen=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`,
+    )
     return text || undefined
   } catch (err) {
     process.stderr.write(`telegram channel: transcription failed: ${err}\n`)
@@ -507,7 +537,7 @@ function resolveParseMode(format: string | undefined): ParseMode | undefined {
 
 
 const mcp = new Server(
-  { name: 'telegram', version: '1.0.0' },
+  { name: 'telegram', version: '1.1.0' },
   {
     capabilities: {
       tools: {},
