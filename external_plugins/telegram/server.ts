@@ -156,7 +156,7 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
       return undefined
     }
     const data = buf.toString('base64')
-    const mimeType = mime || 'audio/ogg'
+    const mimeType = mime || 'audio/opus'
     process.stderr.write(
       `telegram channel: transcribe calling gemini model=${GEMINI_MODEL} bytes=${buf.byteLength} mime=${mimeType}\n`,
     )
@@ -1114,7 +1114,7 @@ bot.on('message:voice', async ctx => {
       size: voice.file_size,
       mime: voice.mime_type,
     },
-    () => transcribeAudio(voice.file_id, voice.mime_type ?? 'audio/ogg'),
+    () => transcribeAudio(voice.file_id, 'audio/opus'),
   )
 })
 
@@ -1133,7 +1133,7 @@ bot.on('message:audio', async ctx => {
       mime: audio.mime_type,
       name,
     },
-    () => transcribeAudio(audio.file_id, audio.mime_type ?? 'audio/mpeg'),
+    () => transcribeAudio(audio.file_id, 'audio/opus'),
   )
 })
 
