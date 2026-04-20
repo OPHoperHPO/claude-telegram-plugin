@@ -80,15 +80,18 @@ const MAX_TRANSCRIBE_BYTES = 19 * 1024 * 1024 // Bot API getFile caps at 20MB
 // Gemini-specific proxy override. Lets user route Gemini API through a
 // different proxy than the Telegram one (or enable proxy only for Gemini).
 // Falls back to PROXY_URL (shared with Telegram) so a single HTTPS_PROXY covers
-// both. @google/genai's HttpOptions exposes no fetch/proxy hook, so we
+// both — unless GEMINI_BASE_URL is set, which implies a custom endpoint
+// (e.g. internal mirror) that should be reached directly without proxy.
+// @google/genai's HttpOptions exposes no fetch/proxy hook, so we
 // monkey-patch globalThis.fetch around each SDK call.
-const GEMINI_PROXY_URL =
-  process.env.GEMINI_HTTPS_PROXY ||
-  process.env.gemini_https_proxy ||
-  process.env.GEMINI_HTTP_PROXY ||
-  process.env.gemini_http_proxy ||
-  PROXY_URL ||
-  undefined
+const GEMINI_PROXY_URL = GEMINI_BASE_URL
+  ? undefined
+  : process.env.GEMINI_HTTPS_PROXY ||
+    process.env.gemini_https_proxy ||
+    process.env.GEMINI_HTTP_PROXY ||
+    process.env.gemini_http_proxy ||
+    PROXY_URL ||
+    undefined
 
 if (GEMINI_PROXY_URL && GEMINI_PROXY_URL !== PROXY_URL) {
   try {
