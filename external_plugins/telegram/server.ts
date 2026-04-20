@@ -18,7 +18,6 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { GoogleGenAI } from '@google/genai'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -102,43 +101,27 @@ if (GEMINI_PROXY_URL && GEMINI_PROXY_URL !== PROXY_URL) {
   }
 }
 
-async function withGeminiProxy<T>(fn: () => Promise<T>): Promise<T> {
-  if (!GEMINI_PROXY_URL) return fn()
-  const orig = globalThis.fetch
-  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
-    orig(input, { ...(init ?? {}), proxy: GEMINI_PROXY_URL } as RequestInit)) as typeof fetch
-  try {
-    return await fn()
-  } finally {
-    globalThis.fetch = orig
-  }
-}
+const geminiFetch: typeof fetch = GEMINI_PROXY_URL
+  ? ((input: RequestInfo | URL, init?: RequestInit) =>
+      fetch(input, { ...(init ?? {}), proxy: GEMINI_PROXY_URL } as RequestInit))
+  : fetch
 
-let geminiClient: GoogleGenAI | null = null
-if (GEMINI_API_KEY) {
-  try {
-    geminiClient = new GoogleGenAI({
-      apiKey: GEMINI_API_KEY,
-      ...(GEMINI_BASE_URL ? { httpOptions: { baseUrl: GEMINI_BASE_URL } } : {}),
-    })
-    const proxyTag = GEMINI_PROXY_URL ? `, proxy=${new URL(GEMINI_PROXY_URL).host}` : ''
-    process.stderr.write(
-      `telegram channel: gemini transcription enabled (model=${GEMINI_MODEL}${
-        GEMINI_BASE_URL ? `, baseUrl=${GEMINI_BASE_URL}` : ''
-      }${proxyTag})\n`,
-    )
-  } catch (err) {
-    process.stderr.write(`telegram channel: failed to init gemini client, transcription disabled: ${err}\n`)
-    geminiClient = null
-  }
+const GEMINI_API_BASE = (GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '')
+const GEMINI_ENABLED = !!GEMINI_API_KEY
+
+if (GEMINI_ENABLED) {
+  const proxyTag = GEMINI_PROXY_URL ? `, proxy=${new URL(GEMINI_PROXY_URL).host}` : ''
+  process.stderr.write(
+    `telegram channel: gemini transcription enabled (model=${GEMINI_MODEL}, baseUrl=${GEMINI_API_BASE}${proxyTag})\n`,
+  )
 }
 
 const TRANSCRIBE_PROMPT =
   'Transcribe this audio verbatim. Return only the transcribed text — no introductions, no labels, no quotation marks, no commentary. If the audio has no speech, return an empty string.'
 
 async function transcribeAudio(file_id: string, mime?: string): Promise<string | undefined> {
-  if (!geminiClient) {
-    process.stderr.write(`telegram channel: transcribe skipped — geminiClient null\n`)
+  if (!GEMINI_ENABLED) {
+    process.stderr.write(`telegram channel: transcribe skipped — GEMINI_API_KEY unset\n`)
     return undefined
   }
   try {
@@ -175,19 +158,38 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
       return undefined
     }
     const data = buf.toString('base64')
+    const mimeType = mime || 'audio/ogg'
     process.stderr.write(
-      `telegram channel: transcribe calling gemini model=${GEMINI_MODEL} bytes=${buf.byteLength} mime=${mime || 'audio/ogg'}\n`,
+      `telegram channel: transcribe calling gemini model=${GEMINI_MODEL} bytes=${buf.byteLength} mime=${mimeType}\n`,
     )
-    const response = await withGeminiProxy(() =>
-      geminiClient!.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [
-          { text: TRANSCRIBE_PROMPT },
-          { inlineData: { mimeType: mime || 'audio/ogg', data } },
-        ],
-      }),
-    )
-    const rawText = response.text ?? ''
+    const endpoint = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY!)}`
+    const body = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: TRANSCRIBE_PROMPT },
+            { inline_data: { mime_type: mimeType, data } },
+          ],
+        },
+      ],
+    }
+    const resp = await geminiFetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => '')
+      process.stderr.write(
+        `telegram channel: transcribe gemini HTTP ${resp.status}: ${errBody.slice(0, 400)}\n`,
+      )
+      return undefined
+    }
+    const json = await resp.json() as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+    }
+    const rawText = json.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('') ?? ''
     const text = rawText.trim()
     process.stderr.write(
       `telegram channel: transcribe gemini response rawLen=${rawText.length} trimLen=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`,
