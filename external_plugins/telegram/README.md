@@ -74,26 +74,57 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 
 | Tool | Purpose |
 | --- | --- |
-| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
+| `reply` | Send to a chat. Takes `chat_id` + `text`; optional `reply_to` (message ID for native threading), `message_thread_id` (forum topic), `files` (absolute paths — images ship as photos, other types as documents, 50MB cap), `format` (`text` / `markdownv2` / `html`). Auto-chunks long text. Returns sent message IDs. |
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
-| `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
+| `edit_message` | Edit a message the bot previously sent. Supports `format` (`text` / `markdownv2` / `html`). Edits don't trigger push notifications. |
+| `pin_message` | Pin a message (e.g. final result). Requires pin permissions in the target chat. Optional `disable_notification`. |
+| `download_attachment` | Fetch a file attachment by `file_id` (from inbound `attachment_file_id` meta) into the local inbox. Capped at 20MB by the Bot API. |
 
 Inbound messages trigger a typing indicator automatically — Telegram shows
 "botname is typing…" while the assistant works on a response.
 
-## Photos
+## Photos & albums
 
-Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the
-local path is included in the `<channel>` notification so the assistant can
-`Read` it. Telegram compresses photos — if you need the original file, send it
-as a document instead (long-press → Send as File).
+Inbound photos land in `~/.claude/channels/telegram/inbox/` and the local path
+rides on the `<channel>` notification as `image_path`. Albums (multiple photos
+in one send) are debounced and delivered as a single notification with all
+paths in `image_paths` (comma-separated). Telegram compresses photos — for the
+original bytes, send as a document (long-press → Send as File).
+
+## Voice transcription (optional)
+
+If `GEMINI_API_KEY` is set, inbound voice notes, audio files, and video notes
+are transcribed via Gemini. The transcript replaces the `(voice message)`
+placeholder and meta carries `transcribed: "true"`. Leave the env var unset to
+skip transcription — payload passes through as a plain placeholder.
+
+| Variable | Purpose |
+| --- | --- |
+| `GEMINI_API_KEY` | Enables transcription. Unset = disabled, no external calls. |
+| `GEMINI_BASE_URL` | Optional custom endpoint (e.g. a proxy or compatible gateway). |
+| `GEMINI_MODEL` | Model override. Default `gemini-3-flash-preview`. |
+
+Put these in `~/.claude/channels/telegram/.env` alongside `TELEGRAM_BOT_TOKEN`,
+or in the shell environment (shell wins). Files ≥20MB are skipped (Bot API
+download cap).
+
+## Inbound context
+
+Meta that may arrive on the `<channel>` block:
+
+- `message_thread_id` — forum topic ID; pass back on `reply` to stay in-topic.
+- `reply_to_message_id`, `reply_to_user`, `reply_to_text` — sender quoted an earlier message.
+- `quote_text` — partial text quote (Telegram's quote-reply feature).
+- `forward_source`, `forward_from` — message was forwarded from there.
+- `image_path` / `image_paths` — local paths for photos.
+- `attachment_file_id` + `attachment_kind` / `attachment_mime` / `attachment_name` / `attachment_size` — non-photo attachments. Call `download_attachment` to fetch.
+- `transcribed: "true"` — content already contains the Gemini transcript.
 
 ## No history or search
 
 Telegram's Bot API exposes **neither** message history nor search. The bot
-only sees messages as they arrive — no `fetch_messages` tool exists. If the
-assistant needs earlier context, it will ask you to paste or summarize.
-
-This also means there's no `download_attachment` tool for historical messages
-— photos are downloaded eagerly on arrival since there's no way to fetch them
-later.
+only sees messages as they arrive. If the assistant needs earlier context, it
+will ask you to paste or summarize. Photos are downloaded eagerly on arrival
+since there's no way to fetch them later; non-photo attachments stay
+addressable via `download_attachment` for as long as Telegram keeps the
+`file_id` valid (typically hours to days).

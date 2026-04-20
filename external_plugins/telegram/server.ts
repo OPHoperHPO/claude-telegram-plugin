@@ -18,6 +18,7 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
+import { GoogleGenAI } from '@google/genai'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -68,6 +69,65 @@ const proxiedFetch: typeof fetch = PROXY_URL
   ? ((input: RequestInfo | URL, init?: RequestInit) =>
       fetch(input, { ...(init ?? {}), proxy: PROXY_URL } as RequestInit))
   : fetch
+
+// Optional Gemini audio transcription. If GEMINI_API_KEY is missing the client
+// is null and inbound voice/audio/video_note pass through as plain placeholders.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || process.env.GEMINI_API_BASE_URL
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview'
+const MAX_TRANSCRIBE_BYTES = 19 * 1024 * 1024 // Bot API getFile caps at 20MB
+
+let geminiClient: GoogleGenAI | null = null
+if (GEMINI_API_KEY) {
+  try {
+    geminiClient = new GoogleGenAI({
+      apiKey: GEMINI_API_KEY,
+      ...(GEMINI_BASE_URL ? { httpOptions: { baseUrl: GEMINI_BASE_URL } } : {}),
+    })
+    process.stderr.write(
+      `telegram channel: gemini transcription enabled (model=${GEMINI_MODEL}${
+        GEMINI_BASE_URL ? `, baseUrl=${GEMINI_BASE_URL}` : ''
+      })\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram channel: failed to init gemini client, transcription disabled: ${err}\n`)
+    geminiClient = null
+  }
+}
+
+const TRANSCRIBE_PROMPT =
+  'Transcribe this audio verbatim. Return only the transcribed text — no introductions, no labels, no quotation marks, no commentary. If the audio has no speech, return an empty string.'
+
+async function transcribeAudio(file_id: string, mime?: string): Promise<string | undefined> {
+  if (!geminiClient) return undefined
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return undefined
+    // Defensive: skip when Telegram omits file_size rather than treating
+    // missing as zero (the Bot API caps at 20MB but don't rely on it).
+    if (file.file_size == null || file.file_size > MAX_TRANSCRIBE_BYTES) return undefined
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await proxiedFetch(url)
+    if (!res.ok) return undefined
+    const contentLength = Number(res.headers.get('content-length') ?? 0)
+    if (contentLength > MAX_TRANSCRIBE_BYTES) return undefined
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.byteLength > MAX_TRANSCRIBE_BYTES) return undefined
+    const data = buf.toString('base64')
+    const response = await geminiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: [
+        { text: TRANSCRIBE_PROMPT },
+        { inlineData: { mimeType: mime || 'audio/ogg', data } },
+      ],
+    })
+    const text = (response.text ?? '').trim()
+    return text || undefined
+  } catch (err) {
+    process.stderr.write(`telegram channel: transcription failed: ${err}\n`)
+    return undefined
+  }
+}
 
 if (!TOKEN) {
   process.stderr.write(
@@ -400,6 +460,15 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+type ParseMode = 'MarkdownV2' | 'HTML'
+function resolveParseMode(format: string | undefined): ParseMode | undefined {
+  if (!format || format === 'text') return undefined
+  if (format === 'markdownv2') return 'MarkdownV2'
+  if (format === 'html') return 'HTML'
+  throw new Error(`unknown format: ${format} (expected text, markdownv2, or html)`)
+}
+
+
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
@@ -418,9 +487,13 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has image_path, Read that file — the photo the sender attached. image_paths (plural, comma-separated) appears for albums — Read each. If attachment_file_id is set, call download_attachment with that file_id to fetch the file, then Read the returned path. If transcribed="true", the content already contains the audio transcript (voice/audio/video_note were decoded via Gemini).',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'Meta may also include message_thread_id (forum topic — pass back so the reply lands in the same topic), reply_to_message_id + reply_to_text (sender quoted an earlier message), quote_text (a partial quote), and forward_source (message was forwarded from there).',
+      '',
+      'Reply with the reply tool — pass chat_id back. Use reply_to (message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses. Pass message_thread_id when it was present inbound. reply accepts file paths (files: ["/abs/path.png"]) for attachments and format: "markdownv2" or "html" for rich text.',
+      '',
+      'Other tools: react (emoji reaction), edit_message (edit a prior bot message; edits don\'t push-notify — send a new reply when a long task completes), pin_message (highlight a final result), download_attachment.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -468,7 +541,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topics, and files (absolute paths) for attachments.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -478,6 +551,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
           },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic / supergroup thread ID. Pass the message_thread_id from inbound meta to reply inside the same topic.',
+          },
           files: {
             type: 'array',
             items: { type: 'string' },
@@ -485,8 +562,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdownv2', 'html'],
+            description: "Rendering mode. 'markdownv2' and 'html' enable Telegram formatting (bold, italic, code, links). Caller must escape per the chosen syntax (MarkdownV2: escape _*[]()~`>#+-=|{}.!; HTML: escape < > &). Default: 'text' (plain, no escaping needed).",
           },
         },
         required: ['chat_id', 'text'],
@@ -527,11 +604,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'markdownv2', 'html'],
+            description: "Rendering mode. 'markdownv2' and 'html' enable Telegram formatting. Default: 'text'.",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
+      },
+    },
+    {
+      name: 'pin_message',
+      description:
+        'Pin a message in the chat (e.g. to highlight a final result). Requires the bot to have pin permissions in the target chat. Pass disable_notification: true to pin silently.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+          disable_notification: { type: 'boolean' },
+        },
+        required: ['chat_id', 'message_id'],
       },
     },
   ],
@@ -545,9 +636,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const message_thread_id = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const parseMode = resolveParseMode(args.format as string | undefined)
 
         assertAllowedChat(chat_id)
 
@@ -575,6 +666,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(message_thread_id != null ? { message_thread_id } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -590,9 +682,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts: Record<string, unknown> = {}
+          if (reply_to != null && replyMode !== 'off') opts.reply_parameters = { message_id: reply_to }
+          if (message_thread_id != null) opts.message_thread_id = message_thread_id
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -635,8 +727,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
-        const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const editParseMode = resolveParseMode(args.format as string | undefined)
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
@@ -645,6 +736,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+      }
+      case 'pin_message': {
+        const chat_id = args.chat_id as string
+        assertAllowedChat(chat_id)
+        await bot.api.pinChatMessage(chat_id, Number(args.message_id), {
+          disable_notification: args.disable_notification === true,
+        })
+        return { content: [{ type: 'text', text: 'pinned' }] }
       }
       default:
         return {
@@ -816,30 +915,104 @@ bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
-bot.on('message:photo', async ctx => {
-  const caption = ctx.message.caption ?? '(photo)'
-  // Defer download until after the gate approves — any user can send photos,
-  // and we don't want to burn API quota or fill the inbox for dropped messages.
-  await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await proxiedFetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, buf)
-      return path
-    } catch (err) {
-      process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
-      return undefined
-    }
+async function downloadPhoto(file_id: string, unique_id: string): Promise<string | undefined> {
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return undefined
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await proxiedFetch(url)
+    const buf = Buffer.from(await res.arrayBuffer())
+    const ext = file.file_path.split('.').pop() ?? 'jpg'
+    const path = join(INBOX_DIR, `${Date.now()}-${unique_id}.${ext}`)
+    mkdirSync(INBOX_DIR, { recursive: true })
+    writeFileSync(path, buf)
+    return path
+  } catch (err) {
+    process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
+    return undefined
+  }
+}
+
+// Media-group (album) buffer. Telegram delivers each album photo as a separate
+// update sharing media_group_id — we debounce so the assistant sees one
+// inbound notification with all image paths instead of N fragments.
+type PhotoGroupBuffer = {
+  ctx: Context
+  access: Access
+  caption: string
+  pending: Promise<string | undefined>[]
+  timer: ReturnType<typeof setTimeout>
+}
+const photoGroups = new Map<string, PhotoGroupBuffer>()
+const MEDIA_GROUP_DEBOUNCE_MS = 1200
+
+async function flushPhotoGroup(key: string): Promise<void> {
+  const buf = photoGroups.get(key)
+  if (!buf) return
+  photoGroups.delete(key)
+  const paths = (await Promise.all(buf.pending)).filter((p): p is string => !!p)
+  const text = buf.caption || `(album: ${paths.length} photo${paths.length === 1 ? '' : 's'})`
+  deliverNotification({
+    ctx: buf.ctx,
+    text,
+    access: buf.access,
+    imagePaths: paths,
   })
+}
+
+bot.on('message:photo', async ctx => {
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
+  const gid = ctx.message.media_group_id
+
+  if (!gid) {
+    const caption = ctx.message.caption ?? '(photo)'
+    // Defer download until after the gate approves — any user can send photos,
+    // and we don't want to burn API quota or fill the inbox for dropped messages.
+    await handleInbound(ctx, caption, () => downloadPhoto(best.file_id, best.file_unique_id))
+    return
+  }
+
+  // Album path — run gate now so we don't waste downloads on dropped groups.
+  const result = gate(ctx)
+  if (result.action === 'drop') return
+  if (result.action === 'pair') {
+    const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    await ctx.reply(
+      `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
+    )
+    return
+  }
+
+  const access = result.access
+  const key = `${ctx.chat!.id}:${gid}`
+  const download = downloadPhoto(best.file_id, best.file_unique_id)
+  const existing = photoGroups.get(key)
+
+  if (!existing) {
+    const buf: PhotoGroupBuffer = {
+      ctx,
+      access,
+      caption: ctx.message.caption ?? '',
+      pending: [download],
+      timer: setTimeout(() => { void flushPhotoGroup(key) }, MEDIA_GROUP_DEBOUNCE_MS),
+    }
+    photoGroups.set(key, buf)
+
+    const chat_id = String(ctx.chat!.id)
+    const msgId = ctx.message.message_id
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    if (access.ackReaction && msgId != null) {
+      void bot.api.setMessageReaction(chat_id, msgId, [
+        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
+      ]).catch(() => {})
+    }
+  } else {
+    existing.pending.push(download)
+    if (ctx.message.caption && !existing.caption) existing.caption = ctx.message.caption
+    clearTimeout(existing.timer)
+    existing.timer = setTimeout(() => { void flushPhotoGroup(key) }, MEDIA_GROUP_DEBOUNCE_MS)
+  }
 })
 
 bot.on('message:document', async ctx => {
@@ -858,25 +1031,37 @@ bot.on('message:document', async ctx => {
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   const text = ctx.message.caption ?? '(voice message)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'voice',
-    file_id: voice.file_id,
-    size: voice.file_size,
-    mime: voice.mime_type,
-  })
+  await handleInbound(
+    ctx,
+    text,
+    undefined,
+    {
+      kind: 'voice',
+      file_id: voice.file_id,
+      size: voice.file_size,
+      mime: voice.mime_type,
+    },
+    () => transcribeAudio(voice.file_id, voice.mime_type ?? 'audio/ogg'),
+  )
 })
 
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
   const text = ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`
-  await handleInbound(ctx, text, undefined, {
-    kind: 'audio',
-    file_id: audio.file_id,
-    size: audio.file_size,
-    mime: audio.mime_type,
-    name,
-  })
+  await handleInbound(
+    ctx,
+    text,
+    undefined,
+    {
+      kind: 'audio',
+      file_id: audio.file_id,
+      size: audio.file_size,
+      mime: audio.mime_type,
+      name,
+    },
+    () => transcribeAudio(audio.file_id, audio.mime_type ?? 'audio/mpeg'),
+  )
 })
 
 bot.on('message:video', async ctx => {
@@ -893,11 +1078,18 @@ bot.on('message:video', async ctx => {
 
 bot.on('message:video_note', async ctx => {
   const vn = ctx.message.video_note
-  await handleInbound(ctx, '(video note)', undefined, {
-    kind: 'video_note',
-    file_id: vn.file_id,
-    size: vn.file_size,
-  })
+  await handleInbound(
+    ctx,
+    '(video note)',
+    undefined,
+    {
+      kind: 'video_note',
+      file_id: vn.file_id,
+      size: vn.file_size,
+    },
+    // video_note is short MP4 with audio; Gemini accepts video/mp4 for transcription.
+    () => transcribeAudio(vn.file_id, 'video/mp4'),
+  )
 })
 
 bot.on('message:sticker', async ctx => {
@@ -916,6 +1108,7 @@ type AttachmentMeta = {
   size?: number
   mime?: string
   name?: string
+  transcribed?: boolean
 }
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
@@ -925,11 +1118,126 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Truncate user-supplied snippets that land in <channel> meta so a long quoted
+// message can't blow up Claude's context. The full message is still fetchable
+// via Telegram if needed, but the preview keeps meta lean.
+const META_SNIPPET_LIMIT = 400
+function snippet(s: string | undefined): string | undefined {
+  if (!s) return undefined
+  const cleaned = s.replace(/[\r\n]+/g, ' ').trim()
+  if (!cleaned) return undefined
+  return cleaned.length > META_SNIPPET_LIMIT
+    ? cleaned.slice(0, META_SNIPPET_LIMIT) + '…'
+    : cleaned
+}
+
+// Pull reply-to and forward-origin context out of the inbound message so
+// Claude sees what the sender was responding to without needing history.
+function buildContextMeta(ctx: Context): Record<string, string> {
+  const meta: Record<string, string> = {}
+  const msg = ctx.message
+  if (!msg) return meta
+
+  if (msg.message_thread_id != null && msg.is_topic_message) {
+    meta.message_thread_id = String(msg.message_thread_id)
+  }
+
+  const reply = msg.reply_to_message
+  if (reply) {
+    meta.reply_to_message_id = String(reply.message_id)
+    const fromRep = reply.from
+    if (fromRep) {
+      meta.reply_to_user = safeName(fromRep.username) ?? String(fromRep.id)
+      meta.reply_to_user_id = String(fromRep.id)
+    }
+    const snip = snippet(reply.text ?? reply.caption)
+    if (snip) meta.reply_to_text = safeName(snip)!
+  }
+
+  // Telegram quote-reply (partial text quote) — feature added in 2023.
+  const quote = (msg as { quote?: { text?: string } }).quote
+  const quoteText = snippet(quote?.text)
+  if (quoteText) meta.quote_text = safeName(quoteText)!
+
+  const fwd = (msg as { forward_origin?: {
+    type: string
+    sender_user?: { id: number; username?: string }
+    sender_user_name?: string
+    sender_chat?: { id: number; title?: string; username?: string }
+    chat?: { id: number; title?: string; username?: string }
+    author_signature?: string
+  } }).forward_origin
+  if (fwd) {
+    meta.forward_from = fwd.type
+    const name =
+      fwd.sender_user?.username ??
+      (fwd.sender_user?.id != null ? String(fwd.sender_user.id) : undefined) ??
+      fwd.sender_user_name ??
+      fwd.sender_chat?.title ??
+      fwd.sender_chat?.username ??
+      fwd.chat?.title ??
+      fwd.chat?.username ??
+      fwd.author_signature
+    if (name) meta.forward_source = safeName(name)!
+  }
+
+  return meta
+}
+
+type DeliverInput = {
+  ctx: Context
+  text: string
+  access: Access
+  imagePath?: string
+  imagePaths?: string[] // media group: multiple images in one notification
+  attachment?: AttachmentMeta
+}
+
+// Shared notification builder so handleInbound and media-group flush emit the
+// same shape of <channel> meta.
+function deliverNotification(input: DeliverInput): void {
+  const { ctx, text, imagePath, imagePaths, attachment } = input
+  const from = ctx.from!
+  const chat_id = String(ctx.chat!.id)
+  const msgId = ctx.message?.message_id
+  const contextMeta = buildContextMeta(ctx)
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta: {
+        chat_id,
+        ...(msgId != null ? { message_id: String(msgId) } : {}),
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        ...contextMeta,
+        ...(imagePath ? { image_path: imagePath } : {}),
+        ...(imagePaths && imagePaths.length > 0
+          ? { image_paths: imagePaths.join(',') }
+          : {}),
+        ...(attachment ? {
+          attachment_kind: attachment.kind,
+          attachment_file_id: attachment.file_id,
+          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+          ...(attachment.transcribed ? { transcribed: 'true' } : {}),
+        } : {}),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  transcribe?: () => Promise<string | undefined>,
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -944,7 +1252,6 @@ async function handleInbound(
   }
 
   const access = result.access
-  const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
 
@@ -986,30 +1293,27 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
-  // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  let finalText = text
+  let transcribedAttachment = attachment
+  if (transcribe) {
+    const t = await transcribe()
+    if (t) {
+      // Treat text as a placeholder if it's empty or a parenthesised tag like
+      // "(voice message)" — replace rather than append in that case.
+      const isPlaceholder = !text || /^\([^)]*\)$/.test(text.trim())
+      finalText = isPlaceholder ? t : `${text}\n\n${t}`
+      if (attachment) {
+        transcribedAttachment = { ...attachment, transcribed: true }
+      }
+    }
+  }
+
+  deliverNotification({
+    ctx,
+    text: finalText,
+    access,
+    imagePath,
+    attachment: transcribedAttachment,
   })
 }
 
