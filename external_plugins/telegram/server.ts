@@ -77,6 +77,40 @@ const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || process.env.GEMINI_API_BA
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview'
 const MAX_TRANSCRIBE_BYTES = 19 * 1024 * 1024 // Bot API getFile caps at 20MB
 
+// Gemini-specific proxy override. Lets user route Gemini API through a
+// different proxy than the Telegram one (or enable proxy only for Gemini).
+// Falls back to PROXY_URL (shared with Telegram) so a single HTTPS_PROXY covers
+// both. @google/genai's HttpOptions exposes no fetch/proxy hook, so we
+// monkey-patch globalThis.fetch around each SDK call.
+const GEMINI_PROXY_URL =
+  process.env.GEMINI_HTTPS_PROXY ||
+  process.env.gemini_https_proxy ||
+  process.env.GEMINI_HTTP_PROXY ||
+  process.env.gemini_http_proxy ||
+  PROXY_URL ||
+  undefined
+
+if (GEMINI_PROXY_URL && GEMINI_PROXY_URL !== PROXY_URL) {
+  try {
+    const u = new URL(GEMINI_PROXY_URL)
+    process.stderr.write(`telegram channel: gemini requests via proxy ${u.protocol}//${u.host}\n`)
+  } catch {
+    process.stderr.write(`telegram channel: invalid gemini proxy URL in env: ${GEMINI_PROXY_URL}\n`)
+  }
+}
+
+async function withGeminiProxy<T>(fn: () => Promise<T>): Promise<T> {
+  if (!GEMINI_PROXY_URL) return fn()
+  const orig = globalThis.fetch
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+    orig(input, { ...(init ?? {}), proxy: GEMINI_PROXY_URL } as RequestInit)) as typeof fetch
+  try {
+    return await fn()
+  } finally {
+    globalThis.fetch = orig
+  }
+}
+
 let geminiClient: GoogleGenAI | null = null
 if (GEMINI_API_KEY) {
   try {
@@ -84,10 +118,11 @@ if (GEMINI_API_KEY) {
       apiKey: GEMINI_API_KEY,
       ...(GEMINI_BASE_URL ? { httpOptions: { baseUrl: GEMINI_BASE_URL } } : {}),
     })
+    const proxyTag = GEMINI_PROXY_URL ? `, proxy=${new URL(GEMINI_PROXY_URL).host}` : ''
     process.stderr.write(
       `telegram channel: gemini transcription enabled (model=${GEMINI_MODEL}${
         GEMINI_BASE_URL ? `, baseUrl=${GEMINI_BASE_URL}` : ''
-      })\n`,
+      }${proxyTag})\n`,
     )
   } catch (err) {
     process.stderr.write(`telegram channel: failed to init gemini client, transcription disabled: ${err}\n`)
@@ -114,13 +149,15 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
     const buf = Buffer.from(await res.arrayBuffer())
     if (buf.byteLength > MAX_TRANSCRIBE_BYTES) return undefined
     const data = buf.toString('base64')
-    const response = await geminiClient.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [
-        { text: TRANSCRIBE_PROMPT },
-        { inlineData: { mimeType: mime || 'audio/ogg', data } },
-      ],
-    })
+    const response = await withGeminiProxy(() =>
+      geminiClient!.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [
+          { text: TRANSCRIBE_PROMPT },
+          { inlineData: { mimeType: mime || 'audio/ogg', data } },
+        ],
+      }),
+    )
     const text = (response.text ?? '').trim()
     return text || undefined
   } catch (err) {
