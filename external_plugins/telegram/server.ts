@@ -160,7 +160,7 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
     process.stderr.write(
       `telegram channel: transcribe calling gemini model=${GEMINI_MODEL} bytes=${buf.byteLength} mime=${mimeType}\n`,
     )
-    const endpoint = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY!)}`
+    const endpoint = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`
     const body = {
       contents: [
         {
@@ -174,7 +174,10 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
     }
     const resp = await geminiFetch(endpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY!,
+      },
       body: JSON.stringify(body),
     })
     if (!resp.ok) {
