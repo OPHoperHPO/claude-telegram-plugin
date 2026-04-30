@@ -171,31 +171,52 @@ async function transcribeAudio(file_id: string, mime?: string): Promise<string |
           ],
         },
       ],
-    }
-    const resp = await geminiFetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY!,
+      generationConfig: {
+        thinkingConfig: { thinkingLevel: 'HIGH' },
       },
-      body: JSON.stringify(body),
-    })
-    if (!resp.ok) {
-      const errBody = await resp.text().catch(() => '')
+    }
+
+    // Retry on 5xx (Google overload) and on empty-text responses. Gemini
+    // thinking models occasionally return a part with only thoughtSignature
+    // and no text. 3 attempts with exponential backoff (500ms, 1s).
+    const MAX_ATTEMPTS = 3
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const resp = await geminiFetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY!,
+        },
+        body: JSON.stringify(body),
+      })
+      if (!resp.ok) {
+        const errBody = await resp.text().catch(() => '')
+        process.stderr.write(
+          `telegram channel: transcribe gemini HTTP ${resp.status} attempt=${attempt}: ${errBody.slice(0, 400)}\n`,
+        )
+        // Retry on 5xx; bail on 4xx (auth, quota, bad request).
+        if (resp.status >= 500 && attempt < MAX_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 500 * 2 ** (attempt - 1)))
+          continue
+        }
+        return undefined
+      }
+      const json = await resp.json() as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+      }
+      const rawText = json.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('') ?? ''
+      const text = rawText.trim()
       process.stderr.write(
-        `telegram channel: transcribe gemini HTTP ${resp.status}: ${errBody.slice(0, 400)}\n`,
+        `telegram channel: transcribe gemini response attempt=${attempt} rawLen=${rawText.length} trimLen=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`,
       )
+      if (text) return text
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, 500 * 2 ** (attempt - 1)))
+        continue
+      }
       return undefined
     }
-    const json = await resp.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
-    }
-    const rawText = json.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('') ?? ''
-    const text = rawText.trim()
-    process.stderr.write(
-      `telegram channel: transcribe gemini response rawLen=${rawText.length} trimLen=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`,
-    )
-    return text || undefined
+    return undefined
   } catch (err) {
     process.stderr.write(`telegram channel: transcription failed: ${err}\n`)
     return undefined
