@@ -16,12 +16,12 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
-import { join, extname, sep } from 'path'
+import { join, extname, sep, basename } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -532,6 +532,64 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+const PHOTO_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+}
+
+/**
+ * Bypass grammy's InputFile path for media uploads.
+ *
+ * grammy serialises file uploads via the Node `form-data` package, which
+ * produces a Readable-stream body. Bun's `fetch` with the `proxy` option
+ * silently drops Readable-stream request bodies, so every grammy call that
+ * carries an InputFile (sendPhoto, sendDocument, sendVideo, ...) hangs and
+ * eventually fails with `Network request for 'sendPhoto' failed!` whenever
+ * HTTPS_PROXY / HTTP_PROXY is set.
+ *
+ * Web-standard FormData backed by a Blob round-trips through Bun's proxied
+ * fetch correctly, so we POST multipart ourselves for the two endpoints we
+ * actually use here. No behaviour change when no proxy is configured.
+ */
+async function sendMediaViaFetch(
+  method: 'sendPhoto' | 'sendDocument',
+  field: 'photo' | 'document',
+  chat_id: string,
+  filePath: string,
+  opts: { reply_parameters?: { message_id: number }; message_thread_id?: number },
+): Promise<number> {
+  const buf = await Bun.file(filePath).arrayBuffer()
+  const ext = extname(filePath).toLowerCase()
+  const mime =
+    field === 'photo'
+      ? PHOTO_MIME[ext] ?? 'application/octet-stream'
+      : 'application/octet-stream'
+
+  const fd = new FormData()
+  fd.append('chat_id', chat_id)
+  if (opts.reply_parameters)
+    fd.append('reply_parameters', JSON.stringify(opts.reply_parameters))
+  if (opts.message_thread_id != null)
+    fd.append('message_thread_id', String(opts.message_thread_id))
+  fd.append(field, new Blob([buf], { type: mime }), basename(filePath))
+
+  const url = `https://api.telegram.org/bot${TOKEN}/${method}`
+  const res = await proxiedFetch(url, { method: 'POST', body: fd })
+  const body = await res.text()
+  let json: { ok: boolean; result?: { message_id: number }; description?: string }
+  try {
+    json = JSON.parse(body)
+  } catch {
+    throw new Error(`${method} HTTP ${res.status}: ${body.slice(0, 200)}`)
+  }
+  if (!res.ok || !json.ok || !json.result) {
+    throw new Error(`${method} failed: ${json.description ?? `HTTP ${res.status}`}`)
+  }
+  return json.result.message_id
+}
 
 type ParseMode = 'MarkdownV2' | 'HTML'
 function resolveParseMode(format: string | undefined): ParseMode | undefined {
@@ -752,19 +810,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
+        //
+        // We bypass grammy's bot.api.sendPhoto / sendDocument here because
+        // grammy uploads via Node's form-data package (Readable stream body)
+        // and Bun's `fetch` with `proxy` does not flush stream-based request
+        // bodies. See sendMediaViaFetch() for details.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts: Record<string, unknown> = {}
+          const opts: { reply_parameters?: { message_id: number }; message_thread_id?: number } = {}
           if (reply_to != null && replyMode !== 'off') opts.reply_parameters = { message_id: reply_to }
           if (message_thread_id != null) opts.message_thread_id = message_thread_id
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          }
+          const isPhoto = PHOTO_EXTS.has(ext)
+          const sentId = await sendMediaViaFetch(
+            isPhoto ? 'sendPhoto' : 'sendDocument',
+            isPhoto ? 'photo' : 'document',
+            chat_id,
+            f,
+            opts,
+          )
+          sentIds.push(sentId)
         }
 
         const result =
